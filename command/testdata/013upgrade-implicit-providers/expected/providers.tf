@@ -1,10 +1,13 @@
 terraform {
   required_providers {
-    cloud = {
-      source = "registry.terraform.io/-/cloud"
+    bar = {
+      source = "registry.terraform.io/hashicorp/bar"
     }
-    some = {
-      source = "registry.terraform.io/-/some"
+    baz = {
+      source = "registry.terraform.io/terraform-providers/baz"
+    }
+    foo = {
+      source = "registry.terraform.io/hashicorp/foo"
     }
   }
 }

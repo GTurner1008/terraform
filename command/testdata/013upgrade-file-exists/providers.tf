@@ -1,2 +1,2 @@
-provider alpha {}
-provider beta {}
+provider foo {}
+provider bar {}
