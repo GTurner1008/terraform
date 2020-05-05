@@ -66,9 +66,11 @@ func (c nilClient) Delete() error { return nil }
 // mockClient is a client that tracks persisted state snapshots only in
 // memory and also logs what it has been asked to do for use in test
 // assertions.
+// Implements ClientForcePusher
 type mockClient struct {
 	current []byte
 	log     []mockClientRequest
+	force   bool
 }
 
 type mockClientRequest struct {
@@ -89,7 +91,11 @@ func (c *mockClient) Get() (*Payload, error) {
 }
 
 func (c *mockClient) Put(data []byte) error {
-	c.appendLog("Put", data)
+	if c.force {
+		c.appendLog("Force Put", data)
+	} else {
+		c.appendLog("Put", data)
+	}
 	c.current = data
 	return nil
 }
@@ -98,6 +104,10 @@ func (c *mockClient) Delete() error {
 	c.appendLog("Delete", c.current)
 	c.current = nil
 	return nil
+}
+
+func (c *mockClient) EnableForcePush() {
+	c.force = true
 }
 
 func (c *mockClient) appendLog(method string, content []byte) {
