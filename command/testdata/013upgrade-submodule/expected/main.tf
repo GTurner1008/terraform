@@ -1,12 +1,9 @@
-provider foo {}
-provider bar {}
 terraform {
   required_providers {
     bar = {
       source = "registry.terraform.io/hashicorp/bar"
-    }
-    foo = {
-      source = "registry.terraform.io/hashicorp/foo"
+      version = "~> 2.0.0"
     }
   }
 }
+

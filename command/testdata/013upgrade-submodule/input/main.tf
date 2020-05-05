@@ -1,6 +1,6 @@
 terraform {
   required_providers {
-    baz = {
+    bar = {
       version = "~> 2.0.0"
     }
   }

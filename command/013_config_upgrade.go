@@ -2,18 +2,19 @@ package command
 
 import (
 	"fmt"
+	"io/ioutil"
 	"log"
 	"os"
-	"path/filepath"
 	"sort"
 	"strings"
-	"text/template"
 
 	"github.com/hashicorp/hcl/v2"
+	"github.com/hashicorp/hcl/v2/hclwrite"
 	"github.com/hashicorp/terraform/addrs"
 	"github.com/hashicorp/terraform/configs"
 	"github.com/hashicorp/terraform/internal/getproviders"
 	"github.com/hashicorp/terraform/tfdiags"
+	"github.com/zclconf/go-cty/cty"
 )
 
 // ZeroThirteenUpgradeCommand upgrades configuration files for a module
@@ -113,6 +114,7 @@ func (c *ZeroThirteenUpgradeCommand) Run(args []string) int {
 
 	// Build up a list of required providers, uniquely by local name
 	requiredProviders := make(map[string]*configs.RequiredProvider)
+	var rewritePaths []string
 
 	// Step 1: copy all explicit provider requirements across
 	for path, file := range files {
@@ -120,6 +122,7 @@ func (c *ZeroThirteenUpgradeCommand) Run(args []string) int {
 
 		for _, rps := range file.RequiredProviders {
 			log.Printf("[DEBUG] found required_providers block")
+			rewritePaths = append(rewritePaths, path)
 			for _, rp := range rps.RequiredProviders {
 				log.Printf("[DEBUG] required_provider %q", rp.Name)
 				if previous, exist := requiredProviders[rp.Name]; exist {
@@ -198,22 +201,131 @@ func (c *ZeroThirteenUpgradeCommand) Run(args []string) int {
 		}
 	}
 
-	// Detect source for each provider
-	detectDiags := c.detectProviderSources(requiredProviders)
-	diags = diags.Append(detectDiags)
-	if diags.HasErrors() {
-		c.Ui.Error(strings.TrimSpace("Unable to detect sources for providers"))
-		c.showDiagnostics(diags)
-		return 1
-	}
+	// We should now have a complete understanding of the provider requirements
+	// stated in the config.  If there are any providers, attempt to detect
+	// their sources, and rewrite the config.
+	if len(requiredProviders) > 0 {
+		detectDiags := c.detectProviderSources(requiredProviders)
+		diags = diags.Append(detectDiags)
+		if diags.HasErrors() {
+			c.Ui.Error("Unable to detect sources for providers")
+			c.showDiagnostics(diags)
+			return 1
+		}
 
-	// Generate the required providers configuration
-	genDiags := generateRequiredProviders(requiredProviders, dir)
-	diags = diags.Append(genDiags)
+		// FIXME
+		if len(rewritePaths) != 1 {
+			c.Ui.Error("Not implemented")
+			c.showDiagnostics(diags)
+			return 1
+		}
+
+		// Load and parse the output configuration file
+		filename := rewritePaths[0]
+		config, err := ioutil.ReadFile(filename)
+		if err != nil {
+			diags = diags.Append(tfdiags.Sourceless(
+				tfdiags.Error,
+				"Unable to read configuration file",
+				fmt.Sprintf("Error when reading configuration file %q: %s", filename, err),
+			))
+			c.showDiagnostics(diags)
+			return 1
+		}
+		out, parseDiags := hclwrite.ParseConfig(config, filename, hcl.InitialPos)
+		diags = diags.Append(parseDiags)
+		if diags.HasErrors() {
+			c.showDiagnostics(diags)
+			return 1
+		}
+
+		// Find all required_providers blocks, and store them alongside a map
+		// back to the parent terraform block.
+		var requiredProviderBlocks []*hclwrite.Block
+		parentBlocks := make(map[*hclwrite.Block]*hclwrite.Block)
+		root := out.Body()
+		for _, rootBlock := range root.Blocks() {
+			if rootBlock.Type() != "terraform" {
+				continue
+			}
+			for _, childBlock := range rootBlock.Body().Blocks() {
+				if childBlock.Type() == "required_providers" {
+					requiredProviderBlocks = append(requiredProviderBlocks, childBlock)
+					parentBlocks[childBlock] = rootBlock
+				}
+			}
+		}
+
+		first, rest := requiredProviderBlocks[0], requiredProviderBlocks[1:]
+
+		// Find the body of the first block to prepare for rewriting it
+		body := first.Body()
+
+		// Build a sorted list of provider local names
+		var localNames []string
+		for localName := range requiredProviders {
+			localNames = append(localNames, localName)
+		}
+		sort.Strings(localNames)
+
+		// Populate the required providers block
+		for _, localName := range localNames {
+			requiredProvider := requiredProviders[localName]
+			var attributes = make(map[string]cty.Value)
+
+			if !requiredProvider.Type.IsZero() {
+				attributes["source"] = cty.StringVal(requiredProvider.Type.String())
+			}
+
+			if version := requiredProvider.Requirement.Required.String(); version != "" {
+				attributes["version"] = cty.StringVal(version)
+			}
+
+			body.SetAttributeValue(localName, cty.MapVal(attributes))
+
+			// FIXME: how do we add the comment if there's no source?
+		}
+
+		// Remove the rest of the blocks (and the parent block, if it's empty)
+		for _, rpBlock := range rest {
+			tfBlock := parentBlocks[rpBlock]
+			tfBody := tfBlock.Body()
+			tfBody.RemoveBlock(rpBlock)
+
+			// If the terraform block has no blocks and no attributes, it's
+			// basically empty (aside from comments and whitespace), so it's
+			// more useful to remove it than leave it in.
+			if len(tfBody.Blocks()) == 0 && len(tfBody.Attributes()) == 0 {
+				root.RemoveBlock(tfBlock)
+			}
+		}
+
+		// Write the config back to the file
+		f, err := os.OpenFile(filename, os.O_TRUNC|os.O_CREATE|os.O_WRONLY, os.ModePerm)
+		if err != nil {
+			diags = diags.Append(tfdiags.Sourceless(
+				tfdiags.Error,
+				"Unable to open configuration file for writing",
+				fmt.Sprintf("Error when reading configuration file %q: %s", filename, err),
+			))
+			c.showDiagnostics(diags)
+			return 1
+		}
+		_, err = out.WriteTo(f)
+		if err != nil {
+			diags = diags.Append(tfdiags.Sourceless(
+				tfdiags.Error,
+				"Unable to rewrite configuration file",
+				fmt.Sprintf("Error when rewriting configuration file %q: %s", filename, err),
+			))
+			c.showDiagnostics(diags)
+			return 1
+		}
+	}
 
 	c.showDiagnostics(diags)
 	if diags.HasErrors() {
-		return 2
+		return 1
 	}
 
 	if len(diags) != 0 {
@@ -276,90 +388,18 @@ func (c *ZeroThirteenUpgradeCommand) detectProviderSources(requiredProviders map
 	return diags
 }
 
-var providersTemplate = template.Must(template.New("providers.tf").Parse(`terraform {
-  required_providers {
-    {{- range $requiredProvider := .}}
-    {{$requiredProvider.Name}} = {
-      {{- if $requiredProvider.Source}}
-      source = "{{$requiredProvider.Source}}"
-	  {{- else}}
-      # TF-UPGRADE-TODO
-      #
-      # No source detected for this provider. You must add a source address
-      # in the following format:
-      #
-      # source = "your.domain.com/organization/{{$requiredProvider.Name}}"
-      #
-      # For more information, see the provider source documentation:
-      #
-      # https://www.terraform.io/docs/configuration/providers.html#provider-source
-      {{- end}}
-      {{- if $requiredProvider.Version}}
-      version = "{{$requiredProvider.Version}}"
-      {{- end}}
-    }
-    {{- end}}
-  }
-}
-`))
-
-// Generate a file with terraform.required_providers blocks for each provider
-func generateRequiredProviders(providers map[string]*configs.RequiredProvider, dir string) tfdiags.Diagnostics {
-	var diags tfdiags.Diagnostics
-	type ProviderRequirement struct {
-		Name    string
-		Source  string
-		Version string
-	}
-	var requirements []ProviderRequirement
-
-	for _, provider := range providers {
-		req := ProviderRequirement{
-			Name:    provider.Name,
-			Version: provider.Requirement.Required.String(),
-		}
-		if !provider.Type.IsZero() {
-			req.Source = provider.Type.String()
-		}
-		requirements = append(requirements, req)
-	}
-	sort.Slice(requirements, func(i, j int) bool {
-		return requirements[i].Name < requirements[j].Name
-	})
-
-	// Find unused file named "providers.tf", or fall back to e.g. "providers-1.tf"
-	path := filepath.Join(dir, "providers.tf")
-	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		for i := 1; ; i++ {
-			path = filepath.Join(dir, fmt.Sprintf("providers-%d.tf", i))
-			if _, err := os.Stat(path); os.IsNotExist(err) {
-				break
-			}
-		}
-	}
-
-	f, err := os.Create(path)
-	if err != nil {
-		diags = diags.Append(tfdiags.Sourceless(
-			tfdiags.Error,
-			"Unable to create providers file",
-			fmt.Sprintf("Error when generating providers configuration at '%s': %s", path, err),
-		))
-		return diags
-	}
-	defer f.Close()
-
-	err = providersTemplate.Execute(f, requirements)
-	if err != nil {
-		diags = diags.Append(tfdiags.Sourceless(
-			tfdiags.Error,
-			"Unable to create providers file",
-			fmt.Sprintf("Error when generating providers configuration at '%s': %s", path, err),
-		))
-		return diags
-	}
-
-	return nil
+func noSourceDetectedComment(name string) string {
+	return fmt.Sprintf(`# TF-UPGRADE-TODO
+#
+# No source detected for this provider. You must add a source address
+# in the following format:
+#
+# source = "your.domain.com/organization/%s"
+#
+# For more information, see the provider source documentation:
+#
+# https://www.terraform.io/docs/configuration/providers.html#provider-source
+`, name)
 }
 
 func (c *ZeroThirteenUpgradeCommand) Help() string {

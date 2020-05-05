@@ -1,3 +1,5 @@
+provider foo {}
+
 terraform {
   required_providers {
     bar = {
